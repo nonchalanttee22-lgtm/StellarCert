@@ -83,7 +83,7 @@ describe('UsersService', () => {
     findByUsername: jest.fn(),
     findByStellarPublicKey: jest.fn(),
     findByEmailVerificationToken: jest.fn(),
-    findUsersWithPasswordResetTokens: jest.fn(),
+    findByPasswordResetSelector: jest.fn(),
     findByRefreshToken: jest.fn(),
     update: jest.fn(),
     delete: jest.fn(),
@@ -545,7 +545,7 @@ describe('UsersService', () => {
       expect(result.message).toContain('If the email exists');
     });
 
-    it('should generate reset token for existing user', async () => {
+    it('should generate selector token for existing user and store only verifier hash', async () => {
       mockUserRepository.findByEmail.mockResolvedValue(mockUser);
       mockUserRepository.update.mockResolvedValue(mockUser);
       (bcrypt.hash as jest.Mock).mockImplementationOnce(
@@ -556,11 +556,18 @@ describe('UsersService', () => {
 
       const queuedResetEmail =
         mockEmailQueueService.queuePasswordReset.mock.calls[0][0];
-      const plainToken = queuedResetEmail.resetLink.split('token=')[1];
-      const storedHash = mockUserRepository.update.mock.calls[0][1]
+      const plainToken = decodeURIComponent(
+        queuedResetEmail.resetLink.split('token=')[1],
+      );
+      const [selector, verifier] = plainToken.split('.');
+      const storedToken = mockUserRepository.update.mock.calls[0][1]
         .passwordResetToken as string;
+      const separatorIndex = storedToken.indexOf('.');
+      const storedSelector = storedToken.slice(0, separatorIndex);
+      const storedVerifierHash = storedToken.slice(separatorIndex + 1);
 
       expect(result.message).toContain('If the email exists');
+      expect(plainToken.split('.')).toHaveLength(2);
       expect(mockUserRepository.update).toHaveBeenCalledWith(
         mockUser.id,
         expect.objectContaining({
@@ -568,12 +575,16 @@ describe('UsersService', () => {
           passwordResetExpires: expect.any(Date),
         }),
       );
-      expect(storedHash).not.toBe(plainToken);
-      expect(bcrypt.hash).toHaveBeenCalledWith(plainToken, 12);
+      expect(storedToken).not.toBe(plainToken);
+      expect(storedSelector).toBe(selector);
+      expect(storedVerifierHash).not.toBe(verifier);
+      expect(bcrypt.hash).toHaveBeenCalledWith(verifier, 12);
       (bcrypt.compare as jest.Mock).mockImplementationOnce(
         async (value: string, hash: string) => hash === `hashed-${value}`,
       );
-      await expect(bcrypt.compare(plainToken, storedHash)).resolves.toBe(true);
+      await expect(bcrypt.compare(verifier, storedVerifierHash)).resolves.toBe(
+        true,
+      );
       expect(emailQueueService.queuePasswordReset).toHaveBeenCalledWith(
         expect.objectContaining({
           to: mockUser.email,
@@ -585,33 +596,37 @@ describe('UsersService', () => {
   });
 
   describe('resetPassword', () => {
-    it('should successfully reset password', async () => {
+    it('should successfully reset password after loading a single selector match', async () => {
       const userWithToken = {
         ...mockUser,
-        passwordResetToken: 'hashed-valid-token',
+        passwordResetToken: 'abcdef.hashed-123456',
         isPasswordResetTokenValid: jest.fn().mockReturnValue(true),
       };
-      mockUserRepository.findUsersWithPasswordResetTokens.mockResolvedValue([
+      mockUserRepository.findByPasswordResetSelector.mockResolvedValue(
         userWithToken,
-      ]);
+      );
       mockUserRepository.update.mockResolvedValue(mockUser);
       (bcrypt.compare as jest.Mock).mockImplementation(
         async (value: string, hash: string) => hash === `hashed-${value}`,
       );
 
       const result = await service.resetPassword({
-        token: 'valid-token',
+        token: 'abcdef.123456',
         newPassword: 'NewP@ss456',
         confirmPassword: 'NewP@ss456',
       });
 
       expect(result.message).toBe('Password reset successfully');
       expect(
-        mockUserRepository.findUsersWithPasswordResetTokens,
-      ).toHaveBeenCalled();
+        mockUserRepository.findByPasswordResetSelector,
+      ).toHaveBeenCalledWith('abcdef');
+      expect(
+        mockUserRepository.findByPasswordResetSelector,
+      ).toHaveBeenCalledTimes(1);
+      expect(bcrypt.compare).toHaveBeenCalledTimes(1);
       expect(bcrypt.compare).toHaveBeenCalledWith(
-        'valid-token',
-        'hashed-valid-token',
+        '123456',
+        'hashed-123456',
       );
       expect(mockUserRepository.update).toHaveBeenCalledWith(mockUser.id, {
         password: 'hashedPassword123',
@@ -620,29 +635,51 @@ describe('UsersService', () => {
       });
     });
 
-    it('should throw BadRequestException for invalid token', async () => {
+    it('should throw BadRequestException for malformed token without lookup or compare', async () => {
+      await expect(
+        service.resetPassword({
+          token: 'malformed-token',
+          newPassword: 'NewP@ss456',
+          confirmPassword: 'NewP@ss456',
+        }),
+      ).rejects.toThrow('Invalid reset token');
+      expect(
+        mockUserRepository.findByPasswordResetSelector,
+      ).not.toHaveBeenCalled();
+      expect(bcrypt.compare).not.toHaveBeenCalled();
+      expect(mockUserRepository.update).not.toHaveBeenCalled();
+    });
+
+    it('should throw BadRequestException for invalid verifier after one compare', async () => {
       const userWithToken = {
         ...mockUser,
-        passwordResetToken: 'hashed-valid-token',
+        passwordResetToken: 'abcdef.hashed-123456',
         isPasswordResetTokenValid: jest.fn().mockReturnValue(true),
       };
-      mockUserRepository.findUsersWithPasswordResetTokens.mockResolvedValue([
+      mockUserRepository.findByPasswordResetSelector.mockResolvedValue(
         userWithToken,
-      ]);
+      );
       (bcrypt.compare as jest.Mock).mockImplementation(
         async (value: string, hash: string) => hash === `hashed-${value}`,
       );
 
       await expect(
         service.resetPassword({
-          token: 'invalid-token',
+          token: 'abcdef.654321',
           newPassword: 'NewP@ss456',
           confirmPassword: 'NewP@ss456',
         }),
       ).rejects.toThrow('Invalid reset token');
+      expect(
+        mockUserRepository.findByPasswordResetSelector,
+      ).toHaveBeenCalledWith('abcdef');
+      expect(
+        mockUserRepository.findByPasswordResetSelector,
+      ).toHaveBeenCalledTimes(1);
+      expect(bcrypt.compare).toHaveBeenCalledTimes(1);
       expect(bcrypt.compare).toHaveBeenCalledWith(
-        'invalid-token',
-        'hashed-valid-token',
+        '654321',
+        'hashed-123456',
       );
       expect(mockUserRepository.update).not.toHaveBeenCalled();
     });
@@ -650,23 +687,30 @@ describe('UsersService', () => {
     it('should throw BadRequestException for expired matching token', async () => {
       const userWithExpiredToken = {
         ...mockUser,
-        passwordResetToken: 'hashed-expired-token',
+        passwordResetToken: 'abcdef.hashed-fedcba',
         isPasswordResetTokenValid: jest.fn().mockReturnValue(false),
       };
-      mockUserRepository.findUsersWithPasswordResetTokens.mockResolvedValue([
-        userWithExpiredToken,
-      ]);
+      mockUserRepository.findByPasswordResetSelector
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(userWithExpiredToken);
       (bcrypt.compare as jest.Mock).mockImplementation(
         async (value: string, hash: string) => hash === `hashed-${value}`,
       );
 
       await expect(
         service.resetPassword({
-          token: 'expired-token',
+          token: 'abcdef.fedcba',
           newPassword: 'NewP@ss456',
           confirmPassword: 'NewP@ss456',
         }),
       ).rejects.toThrow('Reset token has expired');
+      expect(
+        mockUserRepository.findByPasswordResetSelector,
+      ).toHaveBeenNthCalledWith(1, 'abcdef');
+      expect(
+        mockUserRepository.findByPasswordResetSelector,
+      ).toHaveBeenNthCalledWith(2, 'abcdef', true);
+      expect(bcrypt.compare).toHaveBeenCalledTimes(1);
       expect(userWithExpiredToken.isPasswordResetTokenValid).toHaveBeenCalled();
       expect(mockUserRepository.update).not.toHaveBeenCalled();
     });

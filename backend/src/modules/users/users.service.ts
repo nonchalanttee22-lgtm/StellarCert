@@ -354,19 +354,21 @@ export class UsersService {
     }
 
     // Generate password reset token
-    const passwordResetToken = this.generateToken();
+    const passwordResetSelector = this.generateToken();
+    const passwordResetVerifier = this.generateToken();
+    const passwordResetToken = `${passwordResetSelector}.${passwordResetVerifier}`;
     const passwordResetExpires = new Date();
     passwordResetExpires.setHours(
       passwordResetExpires.getHours() + this.PASSWORD_RESET_EXPIRY_HOURS,
     );
 
-    const hashedPasswordResetToken = await bcrypt.hash(
-      passwordResetToken,
+    const hashedPasswordResetVerifier = await bcrypt.hash(
+      passwordResetVerifier,
       this.SALT_ROUNDS,
     );
 
     await this.userRepository.update(user.id, {
-      passwordResetToken: hashedPasswordResetToken,
+      passwordResetToken: `${passwordResetSelector}.${hashedPasswordResetVerifier}`,
       passwordResetExpires,
     });
 
@@ -388,26 +390,40 @@ export class UsersService {
       throw new BadRequestException('Passwords do not match');
     }
 
-    const usersWithResetTokens =
-      await this.userRepository.findUsersWithPasswordResetTokens();
-    let user: User | null = null;
+    const parsedToken = this.parsePasswordResetToken(token);
 
-    for (const candidate of usersWithResetTokens) {
-      if (!candidate.passwordResetToken) {
-        continue;
-      }
-
-      const tokenMatches = await bcrypt.compare(
-        token,
-        candidate.passwordResetToken,
-      );
-      if (tokenMatches) {
-        user = candidate;
-        break;
-      }
+    if (!parsedToken) {
+      throw new BadRequestException('Invalid reset token');
     }
 
+    let user = await this.userRepository.findByPasswordResetSelector(
+      parsedToken.selector,
+    );
+
     if (!user) {
+      user = await this.userRepository.findByPasswordResetSelector(
+        parsedToken.selector,
+        true,
+      );
+    }
+
+    const storedVerifierHash = user?.passwordResetToken
+      ? this.getPasswordResetVerifierHash(
+          user.passwordResetToken,
+          parsedToken.selector,
+        )
+      : null;
+
+    if (!user || !storedVerifierHash) {
+      throw new BadRequestException('Invalid reset token');
+    }
+
+    const tokenMatches = await bcrypt.compare(
+      parsedToken.verifier,
+      storedVerifierHash,
+    );
+
+    if (!tokenMatches) {
       throw new BadRequestException('Invalid reset token');
     }
 
@@ -945,6 +961,45 @@ export class UsersService {
 
   private generateToken(): string {
     return crypto.randomBytes(32).toString('hex');
+  }
+
+  private parsePasswordResetToken(
+    token: string,
+  ): { selector: string; verifier: string } | null {
+    const parts = token.split('.');
+    const tokenPartPattern = /^[a-f0-9]+$/i;
+
+    if (
+      parts.length !== 2 ||
+      !parts[0] ||
+      !parts[1] ||
+      !tokenPartPattern.test(parts[0]) ||
+      !tokenPartPattern.test(parts[1])
+    ) {
+      return null;
+    }
+
+    return { selector: parts[0], verifier: parts[1] };
+  }
+
+  private getPasswordResetVerifierHash(
+    storedToken: string,
+    selector: string,
+  ): string | null {
+    const separatorIndex = storedToken.indexOf('.');
+
+    if (separatorIndex <= 0) {
+      return null;
+    }
+
+    const storedSelector = storedToken.slice(0, separatorIndex);
+    const storedVerifierHash = storedToken.slice(separatorIndex + 1);
+
+    if (storedSelector !== selector || !storedVerifierHash) {
+      return null;
+    }
+
+    return storedVerifierHash;
   }
 
   private async queueVerificationEmail(
