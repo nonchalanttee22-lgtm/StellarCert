@@ -1,13 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import {
-  Repository,
-  SelectQueryBuilder,
-  FindOptionsWhere,
-  ILike,
-  Not,
-  IsNull,
-} from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
 import { User, UserRole, UserStatus } from '../entities/user.entity';
 import { IPaginatedResult, IPaginationOptions } from '../interfaces';
 import { IUserFilter, ISortOptions } from '../interfaces/user.interface';
@@ -62,10 +55,24 @@ export class UserRepository {
     });
   }
 
-  async findUsersWithPasswordResetTokens(): Promise<User[]> {
-    return this.repository.find({
-      where: { passwordResetToken: Not(IsNull()) },
-    });
+  async findByPasswordResetSelector(
+    selector: string,
+    includeExpired = false,
+  ): Promise<User | null> {
+    const queryBuilder = this.repository
+      .createQueryBuilder('user')
+      .where('user.passwordResetToken LIKE :prefix', {
+        prefix: `${selector}.%`,
+      })
+      .take(1);
+
+    if (!includeExpired) {
+      queryBuilder.andWhere('user.passwordResetExpires > :now', {
+        now: new Date(),
+      });
+    }
+
+    return queryBuilder.getOne();
   }
 
   async findByRefreshToken(refreshToken: string): Promise<User | null> {

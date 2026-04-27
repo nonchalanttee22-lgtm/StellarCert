@@ -4,7 +4,7 @@ import {
   ConflictException,
   BadRequestException,
   UnauthorizedException,
-  ForbiddenException
+  ForbiddenException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -36,7 +36,7 @@ import { IAuthTokens, IUserPublic } from './interfaces/user.interface';
 import { CertificateStatsService } from '../certificate/services/stats.service';
 import { AuditService } from '../audit/services/audit.service';
 import { EmailQueueService } from '../email/email-queue.service';
-import { LoggingService } from "../../common/logging/logging.service";
+import { LoggingService } from '../../common/logging/logging.service';
 
 @Injectable()
 export class UsersService {
@@ -52,7 +52,8 @@ export class UsersService {
     private readonly configService: ConfigService,
     private readonly certificateStatsService: CertificateStatsService,
     private readonly auditService: AuditService,
-    private readonly emailQueueService: EmailQueueService, private readonly logger: LoggingService
+    private readonly emailQueueService: EmailQueueService,
+    private readonly logger: LoggingService,
   ) {}
 
   // ==================== Authentication ====================
@@ -353,20 +354,21 @@ export class UsersService {
       };
     }
 
-    // Generate password reset token
-    const passwordResetToken = this.generateToken();
+    const passwordResetSelector = this.generateToken();
+    const passwordResetVerifier = this.generateToken();
+    const passwordResetToken = `${passwordResetSelector}.${passwordResetVerifier}`;
     const passwordResetExpires = new Date();
     passwordResetExpires.setHours(
       passwordResetExpires.getHours() + this.PASSWORD_RESET_EXPIRY_HOURS,
     );
 
-    const hashedPasswordResetToken = await bcrypt.hash(
-      passwordResetToken,
+    const hashedPasswordResetVerifier = await bcrypt.hash(
+      passwordResetVerifier,
       this.SALT_ROUNDS,
     );
 
     await this.userRepository.update(user.id, {
-      passwordResetToken: hashedPasswordResetToken,
+      passwordResetToken: `${passwordResetSelector}.${hashedPasswordResetVerifier}`,
       passwordResetExpires,
     });
 
@@ -388,30 +390,47 @@ export class UsersService {
       throw new BadRequestException('Passwords do not match');
     }
 
-    const usersWithResetTokens =
-      await this.userRepository.findUsersWithPasswordResetTokens();
-    let user: User | null = null;
+    const parsedToken = this.parsePasswordResetToken(token);
 
-    for (const candidate of usersWithResetTokens) {
-      if (!candidate.passwordResetToken) {
-        continue;
-      }
-
-      const tokenMatches = await bcrypt.compare(
-        token,
-        candidate.passwordResetToken,
-      );
-      if (tokenMatches) {
-        user = candidate;
-        break;
-      }
+    if (!parsedToken) {
+      throw new BadRequestException('Invalid reset token');
     }
+
+    const activeUser = await this.userRepository.findByPasswordResetSelector(
+      parsedToken.selector,
+    );
+    const user =
+      activeUser ??
+      (await this.userRepository.findByPasswordResetSelector(
+        parsedToken.selector,
+        true,
+      ));
 
     if (!user) {
       throw new BadRequestException('Invalid reset token');
     }
 
-    if (!user.isPasswordResetTokenValid()) {
+    const storedVerifierHash = this.getPasswordResetVerifierHash(
+      user.passwordResetToken,
+      parsedToken.selector,
+    );
+
+    if (!storedVerifierHash) {
+      throw new BadRequestException('Invalid reset token');
+    }
+
+    const tokenMatches = await bcrypt.compare(
+      parsedToken.verifier,
+      storedVerifierHash,
+    );
+
+    if (!tokenMatches) {
+      throw new BadRequestException('Invalid reset token');
+    }
+
+    const isResetTokenValid = user.isPasswordResetTokenValid();
+
+    if (!activeUser || !isResetTokenValid) {
       throw new BadRequestException('Reset token has expired');
     }
 
@@ -945,6 +964,48 @@ export class UsersService {
 
   private generateToken(): string {
     return crypto.randomBytes(32).toString('hex');
+  }
+
+  private parsePasswordResetToken(
+    token: string,
+  ): { selector: string; verifier: string } | null {
+    const parts = token.split('.');
+
+    if (parts.length !== 2) {
+      return null;
+    }
+
+    const [selector, verifier] = parts;
+    const hexPattern = /^[a-f0-9]+$/i;
+
+    if (!hexPattern.test(selector) || !hexPattern.test(verifier)) {
+      return null;
+    }
+
+    return { selector, verifier };
+  }
+
+  private getPasswordResetVerifierHash(
+    storedToken: string | null | undefined,
+    selector: string,
+  ): string | null {
+    if (!storedToken) {
+      return null;
+    }
+
+    const separatorIndex = storedToken.indexOf('.');
+
+    if (separatorIndex <= 0 || separatorIndex === storedToken.length - 1) {
+      return null;
+    }
+
+    const storedSelector = storedToken.slice(0, separatorIndex);
+
+    if (storedSelector !== selector) {
+      return null;
+    }
+
+    return storedToken.slice(separatorIndex + 1);
   }
 
   private async queueVerificationEmail(
